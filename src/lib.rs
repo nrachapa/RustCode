@@ -5,4 +5,6 @@
 
 pub mod document;
 pub mod language;
+pub mod tabs;
+pub mod terminal;
 pub mod workspace;

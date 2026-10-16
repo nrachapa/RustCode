@@ -5,9 +5,11 @@ edition = "2024"
 rust-version = "1.88"
 
 [dependencies]
+futures = "0.3"
 iced = { version = "0.14", features = ["highlighter"] }
 iced_core = "0.14"
 iced_highlighter = "0.14"
+portable-pty = "0.8"
 rfd = "0.17"
 
 [dev-dependencies]

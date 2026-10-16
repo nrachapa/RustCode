@@ -30,6 +30,12 @@ pub fn view(app: &App) -> Element<'_, Message> {
             "Show Explorer"
         })
         .on_press(Message::ToggleExplorer),
+        button(if app.show_terminal {
+            "Hide Terminal"
+        } else {
+            "Terminal"
+        })
+        .on_press(Message::ToggleTerminal),
         button("Save").on_press(Message::Save),
         button("Save As…").on_press(Message::SaveAs),
         button("Undo").on_press(Message::Undo),

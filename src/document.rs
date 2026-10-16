@@ -31,6 +31,15 @@ struct Snapshot {
     cursor: Cursor,
 }
 
+impl std::fmt::Debug for Document {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Document")
+            .field("path", &self.path)
+            .field("dirty", &self.dirty)
+            .finish()
+    }
+}
+
 /// Which kind of edit was last performed; consecutive keystrokes
 /// of the same kind coalesce into one undo step.
 #[derive(Clone, Copy, PartialEq)]
@@ -189,6 +198,11 @@ impl Document {
     /// A full copy of the text (used for saving and searching).
     pub fn text(&self) -> String {
         self.content.text()
+    }
+
+    /// When the last edit happened — for autosave debounce.
+    pub fn last_edit_at(&self) -> Option<Instant> {
+        self.last_edit.map(|(t, _)| t)
     }
 
     /// The text as it should hit disk: ensures the final line ending.
