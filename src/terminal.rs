@@ -329,6 +329,20 @@ fn named_bytes(
     }
 }
 
+/// Paste text: wrapped in 200~/201~ markers when the shell has bracketed
+/// paste mode on (xterm mode 2004, set by vim et al.).
+pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[200~");
+    }
+    bytes.extend_from_slice(text.as_bytes());
+    if bracketed {
+        bytes.extend_from_slice(b"\x1b[201~");
+    }
+    bytes
+}
+
 /// One contiguous stretch of a line sharing one foreground color.
 #[derive(Debug, Clone)]
 pub struct Run {
@@ -458,7 +472,6 @@ mod tests {
     use super::*;
 
     fn term_with(bytes: &[u8]) -> Terminal {
-        use std::io::Write;
         let (tx, _rx) = futures::channel::mpsc::unbounded::<TermEvent>();
         let session = Session::spawn(std::path::Path::new("/")).ok();
         let config = alacritty_terminal::term::Config {
@@ -548,6 +561,16 @@ mod tests {
 
     fn test_key(c: char) -> iced_core::keyboard::Key {
         iced_core::keyboard::Key::Character(c.to_string().into())
+    }
+
+    #[test]
+    fn paste_wraps_only_in_bracketed_mode() {
+        // Spec: xterm sets mode 2004; pastes arrive wrapped in 200~/201~.
+        assert_eq!(paste_bytes("hello", false), b"hello".as_slice());
+        assert_eq!(
+            paste_bytes("hello", true),
+            b"\x1b[200~hello\x1b[201~".as_slice()
+        );
     }
 
     #[test]
