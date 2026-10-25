@@ -13,7 +13,7 @@ use alacritty_terminal::{
     term::test::TermSize,
     vte::ansi::{self, Color, Rgb},
 };
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::io::Write;
 use std::path::Path;
 
@@ -77,7 +77,11 @@ impl Session {
             .slave
             .spawn_command(cmd)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(Self { master: pair.master, writer, child })
+        Ok(Self {
+            master: pair.master,
+            writer,
+            child,
+        })
     }
 
     /// A readable handle for the reader thread.
@@ -212,7 +216,9 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        self.session.as_mut().map(|s| s.kill());
+        if let Some(s) = self.session.as_mut() {
+            s.kill()
+        }
     }
 }
 
@@ -266,7 +272,8 @@ pub fn key_bytes(
                     _ => return None,
                 };
                 Some(s.as_bytes().to_vec())
-            } else if modifiers.alt() {                // Alt+letter → ESC prefix.
+            } else if modifiers.alt() {
+                // Alt+letter → ESC prefix.
                 let mut v = vec![0x1b];
                 v.extend_from_slice(c.as_bytes());
                 Some(v)
@@ -282,7 +289,9 @@ pub fn key_bytes(
 
 /// CSI modifier value: 1 + shift + 2·alt + 4·ctrl (xterm convention).
 fn modval(modifiers: &iced_core::keyboard::Modifiers) -> u8 {
-    1 + u8::from(modifiers.shift()) + 2 * u8::from(modifiers.alt()) + 4 * u8::from(modifiers.control())
+    1 + u8::from(modifiers.shift())
+        + 2 * u8::from(modifiers.alt())
+        + 4 * u8::from(modifiers.control())
 }
 
 /// Named (non-character) keys → escape sequences, with xterm modifier bits.
@@ -361,26 +370,98 @@ pub struct TermLine {
 
 /// Fallback for the 16 named ANSI colors until the shell sets them (OSC 4).
 const ANSI_FALLBACK: [Rgb; 16] = [
-    Rgb { r: 0x36, g: 0x3a, b: 0x41 }, // black
-    Rgb { r: 0xf2, g: 0x6d, b: 0x50 }, // red
-    Rgb { r: 0xa1, g: 0xbd, b: 0x59 }, // green
-    Rgb { r: 0xfd, g: 0xd0, b: 0x5b }, // yellow
-    Rgb { r: 0x3f, g: 0x78, b: 0xb1 }, // blue
-    Rgb { r: 0xd3, g: 0x86, b: 0x9b }, // magenta
-    Rgb { r: 0x81, g: 0xa2, b: 0xbe }, // cyan
-    Rgb { r: 0x5c, g: 0x67, b: 0x73 }, // white
-    Rgb { r: 0x95, g: 0xa5, b: 0xa6 }, // bright black
-    Rgb { r: 0xf2, g: 0x6d, b: 0x50 },
-    Rgb { r: 0xa1, g: 0xbd, b: 0x59 },
-    Rgb { r: 0xfd, g: 0xd0, b: 0x5b },
-    Rgb { r: 0xb2, g: 0xc7, b: 0xe6 },
-    Rgb { r: 0xd3, g: 0x86, b: 0x9b },
-    Rgb { r: 0x81, g: 0xa2, b: 0xbe },
-    Rgb { r: 0x95, g: 0xa5, b: 0xa6 },
+    Rgb {
+        r: 0x36,
+        g: 0x3a,
+        b: 0x41,
+    }, // black
+    Rgb {
+        r: 0xf2,
+        g: 0x6d,
+        b: 0x50,
+    }, // red
+    Rgb {
+        r: 0xa1,
+        g: 0xbd,
+        b: 0x59,
+    }, // green
+    Rgb {
+        r: 0xfd,
+        g: 0xd0,
+        b: 0x5b,
+    }, // yellow
+    Rgb {
+        r: 0x3f,
+        g: 0x78,
+        b: 0xb1,
+    }, // blue
+    Rgb {
+        r: 0xd3,
+        g: 0x86,
+        b: 0x9b,
+    }, // magenta
+    Rgb {
+        r: 0x81,
+        g: 0xa2,
+        b: 0xbe,
+    }, // cyan
+    Rgb {
+        r: 0x5c,
+        g: 0x67,
+        b: 0x73,
+    }, // white
+    Rgb {
+        r: 0x95,
+        g: 0xa5,
+        b: 0xa6,
+    }, // bright black
+    Rgb {
+        r: 0xf2,
+        g: 0x6d,
+        b: 0x50,
+    },
+    Rgb {
+        r: 0xa1,
+        g: 0xbd,
+        b: 0x59,
+    },
+    Rgb {
+        r: 0xfd,
+        g: 0xd0,
+        b: 0x5b,
+    },
+    Rgb {
+        r: 0xb2,
+        g: 0xc7,
+        b: 0xe6,
+    },
+    Rgb {
+        r: 0xd3,
+        g: 0x86,
+        b: 0x9b,
+    },
+    Rgb {
+        r: 0x81,
+        g: 0xa2,
+        b: 0xbe,
+    },
+    Rgb {
+        r: 0x95,
+        g: 0xa5,
+        b: 0xa6,
+    },
 ];
 
-pub const DEFAULT_FG: Rgb = Rgb { r: 0xc7, g: 0xcc, b: 0xd1 };
-pub const DEFAULT_BG: Rgb = Rgb { r: 0x1e, g: 0x21, b: 0x26 };
+pub const DEFAULT_FG: Rgb = Rgb {
+    r: 0xc7,
+    g: 0xcc,
+    b: 0xd1,
+};
+pub const DEFAULT_BG: Rgb = Rgb {
+    r: 0x1e,
+    g: 0x21,
+    b: 0x26,
+};
 
 /// Resolves an SGR color against the terminal palette, with fallbacks.
 fn resolve(color: &Color) -> Rgb {
@@ -396,7 +477,11 @@ fn resolve(color: &Color) -> Rgb {
                 let g5 = (i >> 2) & 7;
                 let b5 = i & 7;
                 let f = |v: u32| if v == 0 { 0 } else { 55 + 40 * v };
-                Rgb { r: f(r5 as u32) as u8, g: f(g5 as u32) as u8, b: f(b5 as u32) as u8 }
+                Rgb {
+                    r: f(r5 as u32) as u8,
+                    g: f(g5 as u32) as u8,
+                    b: f(b5 as u32) as u8,
+                }
             } else if (232..256).contains(&(*i as usize)) {
                 let v = (8 + 10 * (*i as usize - 232)) as u8;
                 Rgb { r: v, g: v, b: v }
@@ -406,11 +491,7 @@ fn resolve(color: &Color) -> Rgb {
         }
         Color::Named(n) => {
             let i = *n as usize;
-            if i < 16 {
-                ANSI_FALLBACK[i]
-            } else {
-                DEFAULT_FG
-            }
+            if i < 16 { ANSI_FALLBACK[i] } else { DEFAULT_FG }
         }
     }
 }
@@ -439,7 +520,12 @@ impl Terminal {
                             runs.push(r);
                         }
                         let text = cell.c.to_string();
-                        let mut r = Run { col, fg, bg, text: String::new() };
+                        let mut r = Run {
+                            col,
+                            fg,
+                            bg,
+                            text: String::new(),
+                        };
                         r.text = text;
                         cur = Some(r);
                     }
@@ -460,7 +546,7 @@ impl Terminal {
         let top = self.term.grid().topmost_line().0;
         let row = p.line.0 - top;
         if (0..TERM_ROWS as i32).contains(&row) {
-            Some((row as usize, p.column.0 as usize))
+            Some((row as usize, p.column.0))
         } else {
             None
         }
@@ -520,8 +606,14 @@ mod tests {
         // the content into scrollback, which this fixed-size test grid lacks).
         let t = term_with(b"\x1b[?1049hjunk\r\ntext\x1b[2J");
         let lines = t.lines();
-        let all: String = lines.iter().flat_map(|l| l.runs.iter().flat_map(|r| r.text.chars())).collect();
-        assert!(!all.contains("junk") && !all.contains("text"), "got {all:?}");
+        let all: String = lines
+            .iter()
+            .flat_map(|l| l.runs.iter().flat_map(|r| r.text.chars()))
+            .collect();
+        assert!(
+            !all.contains("junk") && !all.contains("text"),
+            "got {all:?}"
+        );
     }
 
     #[test]
@@ -533,30 +625,42 @@ mod tests {
 
     #[test]
     fn key_mapping_ctrl_c() {
-        use iced_core::keyboard::{key, Key, Modifiers};
+        use iced_core::keyboard::{Key, Modifiers, key};
         let m = Modifiers::CTRL;
         assert_eq!(key_bytes(&Key::Named(key::Named::Control), &m), None);
     }
 
     #[test]
     fn key_mapping_basics() {
-        use iced_core::keyboard::{key, Key, Modifiers};
+        use iced_core::keyboard::{Key, Modifiers, key};
         let none = Modifiers::empty();
-        assert_eq!(key_bytes(&Key::Character("l".into()), &none), Some(b"l".to_vec()));
-        assert_eq!(key_bytes(&Key::Named(key::Named::Enter), &none), Some(b"\r".to_vec()));
+        assert_eq!(
+            key_bytes(&Key::Character("l".into()), &none),
+            Some(b"l".to_vec())
+        );
+        assert_eq!(
+            key_bytes(&Key::Named(key::Named::Enter), &none),
+            Some(b"\r".to_vec())
+        );
         assert_eq!(
             key_bytes(&Key::Named(key::Named::ArrowUp), &none),
             Some(b"\x1b[A".to_vec())
         );
         let ctrl = Modifiers::CTRL;
-        assert_eq!(key_bytes(&Key::Character("c".into()), &ctrl), Some(vec![0x03]));
+        assert_eq!(
+            key_bytes(&Key::Character("c".into()), &ctrl),
+            Some(vec![0x03])
+        );
         let shift = Modifiers::SHIFT;
         assert_eq!(
             key_bytes(&Key::Named(key::Named::ArrowUp), &shift),
             Some(b"\x1b[1;2A".to_vec())
         );
         let alt = Modifiers::ALT;
-        assert_eq!(key_bytes(&Key::Character("a".into()), &alt), Some(vec![0x1b, b'a']));
+        assert_eq!(
+            key_bytes(&Key::Character("a".into()), &alt),
+            Some(vec![0x1b, b'a'])
+        );
     }
 
     fn test_key(c: char) -> iced_core::keyboard::Key {

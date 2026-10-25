@@ -3,17 +3,18 @@
 //! One `App` per window. The window/store split from the architecture plan
 //! lands with Stage 3 (multiple windows).
 
-use iced::widget::{button, operation, scrollable, text, text_editor, text_input};
+use iced::widget::{button, operation, text, text_editor, text_input};
 use iced::{Color, Element, Fill, Font, Length, Task, Theme};
 use rustcode::document::save;
 use rustcode::tabs::Tabs;
-use rustcode::terminal::{self, AnsiFilter, Session};
+use rustcode::terminal::{self, TermEvent, Terminal};
 use rustcode::workspace::Workspace;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const EDITOR_ID: &str = "editor";
-const TERM_SCROLL_ID: &str = "term-scroll";
+/// The 1px focus sink: keyboard focus for the terminal canvas.
+const TERM_INPUT_ID: &str = "term-input";
 /// Quiescence before autosave fires.
 const AUTOSAVE_DELAY: Duration = Duration::from_secs(2);
 
@@ -30,11 +31,13 @@ pub struct App {
     /// re-highlight: the widget re-highlights everything when the format
     /// *function* pointer changes, even if the settings are identical.
     hl_gen: bool,
-    // Terminal: a pty-backed shell, line-oriented.
-    term: Option<Session>,
-    term_filter: AnsiFilter,
-    term_output: String,
-    term_input: String,
+    // Terminal: a pty-backed VT terminal (the pty lives in `Terminal`).
+    term: Option<Terminal>,
+    /// Which surface owns the keyboard: false = editor, true = terminal.
+    term_focused: bool,
+    /// The focus sink's value — never shown (the widget is 1px), only held
+    /// so iced can rebuild it.
+    term_sink: String,
     term_tx: futures::channel::mpsc::UnboundedSender<TermEvent>,
     // Autosave debounce: a background thread fires a tick after
     // AUTOSAVE_DELAY of no edits.
@@ -60,15 +63,6 @@ struct Prompt {
     name: String,
 }
 
-/// Events from the terminal reader thread.
-#[derive(Debug, Clone)]
-pub enum TermEvent {
-    /// Raw pty bytes (ANSI stripped on arrival).
-    Output(Vec<u8>),
-    /// The shell process exited.
-    Exited,
-}
-
 #[derive(Debug, Clone)]
 pub enum Message {
     NewFile,
@@ -89,8 +83,15 @@ pub enum Message {
     PromptName(String),
     PromptSubmit,
     PromptCancel,
-    TermInput(String),
-    TermSubmit(String),
+    /// A raw key event (from `listen_raw`); acted on only when the terminal
+    /// has focus.
+    Key(iced_core::keyboard::Event),
+    /// Text pasted via ⌘V into the focused terminal.
+    Pasted(String),
+    /// The canvas was clicked: route the keyboard to the terminal.
+    TermFocus,
+    /// Terminal scroll, in lines; positive = down.
+    TermScroll(f32),
     TermEvent(TermEvent),
     AutosaveTick(u64),
 }
@@ -131,9 +132,8 @@ impl App {
             status: None,
             hl_gen: false,
             term: None,
-            term_filter: AnsiFilter::default(),
-            term_output: String::new(),
-            term_input: String::new(),
+            term_focused: false,
+            term_sink: String::new(),
             term_tx: term_tx.clone(),
             autosave_seq: 0,
             autosave_tx: deb_tx,
@@ -142,11 +142,10 @@ impl App {
         };
 
         // The shell starts in $HOME; opening a folder respawns it there.
+        // `Terminal::spawn` also starts its pty-reader thread.
         let home = dirs_home();
-        if let Ok(session) = Session::spawn(&home) {
-            app.term_output = format!("$ shell in {}\n", home.display());
-            app.term = Some(session);
-            app.spawn_term_reader();
+        if let Ok(term) = Terminal::spawn(&home, app.term_tx.clone()) {
+            app.term = Some(term);
         }
 
         // Autosave debounce: one long-lived thread.
@@ -175,53 +174,22 @@ impl App {
         (app, Task::batch(tasks))
     }
 
-    fn spawn_term_reader(&mut self) {
-        let Some(session) = self.term.as_ref() else {
-            return;
-        };
-        let Ok(mut reader) = session.reader() else {
-            return;
-        };
-        let tx = self.term_tx.clone();
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = [0u8; 16 * 1024];
-            loop {
-                match reader.read(&mut buf) {
-                    Ok(0) => {
-                        let _ = tx.unbounded_send(TermEvent::Exited);
-                        break;
-                    }
-                    Ok(n) => {
-                        let _ = tx.unbounded_send(TermEvent::Output(buf[..n].to_vec()));
-                    }
-                    Err(_) => break,
-                }
-            }
-        });
-    }
-
-    /// (Re)spawns the shell in `cwd`, resetting the output buffer.
+    /// (Re)spawns the shell in `cwd`, replacing the terminal (and its grid).
     fn respawn_terminal(&mut self, cwd: &Path) {
-        self.term = match Session::spawn(cwd) {
-            Ok(session) => {
-                self.term_filter.reset();
-                self.term_output = format!("$ shell in {}\n", cwd.display());
-                Some(session)
-            }
+        self.term = match Terminal::spawn(cwd, self.term_tx.clone()) {
+            Ok(term) => Some(term),
             Err(e) => {
                 self.status = Some(format!("Terminal: {e}"));
                 None
             }
         };
-        if self.term.is_some() {
-            self.spawn_term_reader();
-        }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Action(action) => {
+                // Any editor event means the editor has the keyboard.
+                self.term_focused = false;
                 let is_edit = matches!(action, text_editor::Action::Edit(_));
                 if let Some(doc) = self.tabs.active_mut() {
                     doc.edit(action);
@@ -271,6 +239,11 @@ impl App {
             Message::ToggleExplorer => self.show_explorer = !self.show_explorer,
             Message::ToggleTerminal => {
                 self.show_terminal = !self.show_terminal;
+                // Hiding the panel removes the focus sink; keys go back to
+                // the editor rather than an invisible terminal.
+                if !self.show_terminal {
+                    self.term_focused = false;
+                }
                 if self.show_terminal && self.term.is_none() {
                     self.respawn_terminal(&dirs_home());
                 }
@@ -337,35 +310,45 @@ impl App {
             }
             Message::PromptSubmit => self.submit_prompt(),
             Message::PromptCancel => self.prompt = None,
-            Message::TermInput(value) => {
-                let old = std::mem::replace(&mut self.term_input, value.clone());
-                if let (Some(session), data) = (&mut self.term, term_input_diff(&old, &value))
-                    && !data.is_empty()
+            Message::Key(event) => return self.handle_terminal_key(event),
+            Message::Pasted(text) => {
+                if self.term_focused
+                    && !text.is_empty()
+                    && let Some(term) = self.term.as_mut()
                 {
-                    session.write(&data).ok();
+                    let bytes = terminal::paste_bytes(&text, term.bracketed_paste());
+                    term.write_bytes(&bytes);
                 }
             }
-            Message::TermSubmit(line) => {
-                if let Some(session) = &mut self.term {
-                    let mut data = line.clone().into_bytes();
-                    data.push(b'\n');
-                    session.write(&data).ok();
+            Message::TermFocus => {
+                self.term_focused = true;
+                return operation::focus(TERM_INPUT_ID);
+            }
+            Message::TermScroll(lines) => {
+                if let Some(term) = self.term.as_mut() {
+                    term.scroll(lines as i32);
                 }
-                self.term_input.clear();
             }
             Message::TermEvent(event) => match event {
                 TermEvent::Output(chunk) => {
-                    terminal::append_output(&mut self.term_output, &chunk, &mut self.term_filter);
+                    if let Some(term) = self.term.as_mut() {
+                        term.feed(&chunk);
+                    }
+                }
+                TermEvent::PtyWrite(bytes) => {
+                    if let Some(term) = self.term.as_mut() {
+                        term.write_bytes(&bytes);
+                    }
                 }
                 TermEvent::Exited => {
-                    self.term_filter.reset();
-                    self.term_output.push_str("(shell exited — restarting)\n");
                     let cwd = self
                         .workspace
                         .as_ref()
                         .map(|w| w.root.clone())
                         .unwrap_or_else(dirs_home);
-                    self.respawn_terminal(&cwd);
+                    if let Some(term) = self.term.as_mut() {
+                        term.restart_shell(&cwd);
+                    }
                 }
             },
             Message::AutosaveTick(seq) => {
@@ -717,43 +700,104 @@ impl App {
         editor.into()
     }
 
-    /// The terminal panel: output (ANSI-stripped tail) + a command line.
+    /// The terminal panel: a canvas drawing the alacritty grid, plus the 1px
+    /// focus sink that gives the terminal keyboard focus.
     fn terminal_view(&self) -> Element<'_, Message> {
-        // Bounded tail keeps the text layout cheap.
-        let mut tail: Vec<&str> = self.term_output.lines().rev().take(150).collect();
-        tail.reverse();
-        let faded = Color::from([0.55, 0.55, 0.6]);
-        let output = scrollable(
-            text(tail.join("\n"))
+        let content: Element<'_, Message> = match self.term.as_ref() {
+            Some(term) => crate::terminal_view::view(term, self.term_focused).into(),
+            None => text("Terminal failed to start")
                 .font(Font::with_name("Menlo"))
-                .size(13),
+                .size(12)
+                .into(),
+        };
+        // The sink stays in the tree always: removing a focused widget drops
+        // focus unpredictably; at 1px it is invisible.
+        let sink = iced::widget::center(
+            text_input("", &self.term_sink)
+                .id(TERM_INPUT_ID)
+                .padding(0)
+                .width(Length::Fixed(1.0)),
         )
-        .id(TERM_SCROLL_ID)
-        .anchor_bottom()
-        .width(Length::Fill)
-        .height(Length::Fixed(190.0));
-        let input = text_input("Type a command…", &self.term_input)
-            .font(Font::with_name("Menlo"))
-            .size(13)
-            .on_input(Message::TermInput)
-            .on_submit(Message::TermSubmit(self.term_input.clone()));
-        let content = iced::widget::column![
-            text("Terminal — line mode; full-screen apps (vim, less) will garble")
-                .size(11)
-                .color(faded),
-            output,
-            iced::widget::row![text("❯").size(13).color(faded), input].spacing(6),
-        ]
-        .spacing(6)
-        .padding(10)
-        .align_x(iced::Alignment::Start);
-        iced::widget::container(content)
-            .width(Length::Fill)
+        .height(Length::Fixed(1.0));
+        let row = iced::widget::Row::new().spacing(0).push(content).push(sink);
+        iced::widget::container(row)
             .style(|_t| iced::widget::container::Style {
                 background: Some(iced::Background::Color(Color::from([0.09, 0.1, 0.11]))),
                 ..Default::default()
             })
             .into()
+    }
+
+    /// Raw key events: act on them only while the terminal has focus.
+    /// App shortcuts (⌘S, ⌘Z, …) still win; ⌘V pastes into the shell.
+    fn handle_terminal_key(&mut self, event: iced_core::keyboard::Event) -> Task<Message> {
+        let iced_core::keyboard::Event::KeyPressed {
+            key,
+            physical_key,
+            modifiers,
+            ..
+        } = event
+        else {
+            return Task::none();
+        };
+        if !self.term_focused {
+            return Task::none();
+        }
+        if modifiers.command() {
+            match key.to_latin(physical_key) {
+                Some('v') => {
+                    return iced::clipboard::read()
+                        .map(|text| Message::Pasted(text.unwrap_or_default()));
+                }
+                Some('s') => return self.save_action(),
+                Some('o') => return self.open_action(),
+                Some('z') if modifiers.shift() => return self.redo_action(),
+                Some('z') => return self.undo_action(),
+                Some('y') => return self.redo_action(),
+                // Other ⌘ combinations: swallowed while the terminal has focus.
+                _ => return Task::none(),
+            }
+        }
+        if let (Some(term), Some(bytes)) =
+            (self.term.as_mut(), terminal::key_bytes(&key, &modifiers))
+        {
+            term.write_bytes(&bytes);
+        }
+        Task::none()
+    }
+
+    fn save_action(&mut self) -> Task<Message> {
+        if self.doc().is_some_and(|d| d.path.is_none()) {
+            self.save_as();
+        } else {
+            self.save_active();
+        }
+        Task::none()
+    }
+
+    fn open_action(&mut self) -> Task<Message> {
+        if let Some(path) = rfd::FileDialog::new().set_title("Open file").pick_file() {
+            self.open_file(&path);
+        }
+        Task::none()
+    }
+
+    fn undo_action(&mut self) -> Task<Message> {
+        if let Some(doc) = self.tabs.active_mut()
+            && doc.undo()
+        {
+            self.hl_gen = !self.hl_gen;
+        }
+        Task::none()
+    }
+
+    fn redo_action(&mut self) -> Task<Message> {
+        if let Some(doc) = self.tabs.active_mut()
+            && doc.redo()
+        {
+            self.hl_gen = !self.hl_gen;
+        }
+        Task::none()
     }
 
     fn status_view(&self) -> Element<'_, Message> {
@@ -826,22 +870,6 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|_| PathBuf::from("/"))
 }
 
-/// Diff a text input's whole new value against the old one:
-/// insertions are the suffix, deletions become DEL bytes, anything else
-/// (e.g. a pasted selection) is sent whole.
-fn term_input_diff(old: &str, new: &str) -> Vec<u8> {
-    if old == new {
-        return Vec::new();
-    }
-    if let Some(suffix) = new.strip_prefix(old) {
-        return suffix.as_bytes().to_vec();
-    }
-    if let Some(removed) = old.strip_prefix(new) {
-        return vec![0x7f; removed.chars().count()];
-    }
-    new.as_bytes().to_vec()
-}
-
 /// Native yes/no; returns `true` to proceed (i.e. the user chose Yes).
 fn confirm_discard() -> bool {
     let answer = rfd::MessageDialog::new()
@@ -857,20 +885,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn input_diff_insertion() {
-        assert_eq!(term_input_diff("", "ls"), b"ls".to_vec());
-        assert_eq!(term_input_diff("ls", "ls -l"), b" -l".to_vec());
-        assert!(term_input_diff("ls", "ls").is_empty());
-    }
-
-    #[test]
-    fn input_diff_backspace_counts_chars() {
-        assert_eq!(term_input_diff("abc", "ab"), vec![0x7f]);
-        assert_eq!(term_input_diff("aé", "a"), vec![0x7f]); // 2-byte char, one DEL
-    }
-
-    #[test]
-    fn input_diff_replacement_sends_whole() {
-        assert_eq!(term_input_diff("abc", "xyz"), b"xyz".to_vec());
+    fn key_bytes_are_wired() {
+        // Smoke guard: plain character and Enter still map through.
+        use iced_core::keyboard::{Key, Modifiers, key};
+        assert_eq!(
+            terminal::key_bytes(&Key::Character("l".into()), &Modifiers::NONE),
+            Some(b"l".to_vec())
+        );
+        assert_eq!(
+            terminal::key_bytes(&Key::Named(key::Named::Enter), &Modifiers::NONE),
+            Some(vec![0x0d]) // CR, what the pty expects
+        );
     }
 }
