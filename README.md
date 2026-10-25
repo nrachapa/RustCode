@@ -5,8 +5,8 @@ A lightweight native code editor for macOS (Apple Silicon), written in Rust on
 and Java files with syntax highlighting, multiple open tabs, autosave, a
 file-explorer sidebar, and a terminal panel.
 
-Not a full IDE: no debugger, LSP, or extension system. The terminal is
-line-oriented (output is ANSI-stripped; full-screen apps like vim garble).
+Not a full IDE: no debugger, LSP, or extension system. The terminal is a
+real xterm/VT100 terminal (vim and less work); it has no tabs yet.
 
 - **Tabs**: opening a file adds a tab (or focuses the existing one); tabs are
   never silently discarded — closing a dirty tab asks first.
@@ -34,9 +34,9 @@ file target/release/rustcode   # → Mach-O 64-bit executable arm64
 ## Tests
 
 ```sh
-cargo test           # 31 unit tests: language detection, atomic save,
+cargo test           # unit tests: language detection, atomic save,
                      # binary/UTF-8 rejection, undo/redo, workspace tree,
-                     # tabs, ANSI filtering, terminal input diffing
+                     # tabs, VT escape-sequence handling (C0/CSI/SGR), key mapping
 make check           # fmt + clippy (-D warnings) + test, in one go
 cargo clippy --all-targets
 ```
@@ -57,7 +57,7 @@ Use the manual checklist below for every meaningful change.
 8. Resize the window; long unindented lines scroll horizontally without wrapping.
 9. **⌘O** opens the file picker from the keyboard; **Tab** inserts four spaces; **⌘/Ctrl+Z** undoes, **⇧⌘Z** / **⌘Y** redoes — colors stay correct after each and after switching tabs.
 10. **Open Folder…** (toolbar) → the sidebar shows the folder's tree. Click a folder to expand/collapse; click a file to open it in a tab (opening a file, then a folder, loses nothing — the file keeps its tab). The New File / New Folder / Rename / Delete / Refresh buttons act on the selected entry (Delete confirms; directories are never deleted).
-11. **Terminal** (toolbar) → a bottom panel with a live shell in the opened folder. Run `pwd`, `ls` (colored output appears as plain text), `echo hi`. `exit` restarts the shell. Full-screen apps (vim, less) garble — that's the documented line-mode limit.
+11. **Terminal** (toolbar) → a bottom panel with a live shell in the opened folder. **Click it** to type — keys go to the shell while it has focus, to the editor otherwise (the block cursor shows which has it). Full-screen apps (vim, less) now work; ⌘V pastes (bracketed), the wheel scrolls the 10,000-line history, `exit` restarts the shell.
 
 ## Packaging
 
@@ -82,8 +82,9 @@ src/
 ├── app.rs         # per-window state: tabs, terminal, autosave, layout
 ├── toolbar.rs     # mouse-first file controls
 ├── explorer.rs    # file-explorer sidebar (tree + actions)
+├── terminal_view.rs # terminal canvas: renders the alacritty grid, keys, scroll
 └── (lib.rs)       # testable core: document/, workspace/, tabs.rs,
-                   # terminal.rs (pty + ANSI filter), language.rs
+                   # terminal.rs (pty + alacritty VT grid), language.rs
 docs/iced-0.14-api-notes.md   # verified iced 0.14 API (read before widget work)
 ```
 
@@ -94,9 +95,9 @@ matching, settings persistence, worker pool for off-thread file I/O.
 
 - Single window (multiple windows is Stage 3).
 - The explorer lists one folder; there is no project tree across folders yet.
-- Terminal: line-oriented (ANSI stripped, not interpreted) at a fixed
-  200×50 pty; no scrollback beyond the last 150 lines shown; the shell
-  restarts on `exit` and when a new folder is opened.
+- Terminal: 80×30 alacritty grid (~10,000 lines of scroll history, not
+  all visible in the 80×30 viewport); the shell restarts on `exit` and
+  when a new folder is opened; no terminal tabs yet.
 - Autosave runs on a 2 s debounce after typing; it saves only files that
   already have a path.
 - File dialogs and folder I/O block the UI thread while open (worker pool is Stage 2).
