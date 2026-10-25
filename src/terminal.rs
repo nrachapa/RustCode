@@ -1,106 +1,48 @@
-//! Terminal panel: a pty-backed, *line-oriented* terminal.
+//! Terminal: a real VT terminal.
 //!
-//! Limitation: escape sequences are stripped, not interpreted, so output is
-//! readable but full-screen programs (vim, less, htop) will garble.
+//! Emulation is alacritty's `Term` (vte state machine + cell grid, exactly
+//! what lapce embeds); the shell runs on a pty (`portable-pty`). The UI
+//! renders the cell grid (see `terminal_view`), and keys are mapped to byte
+//! sequences the way alacritty's front end does.
 
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use alacritty_terminal::{
+    Term,
+    event::{Event, EventListener},
+    grid::{Dimensions, Scroll},
+    index::{Column, Line, Point},
+    term::test::TermSize,
+    vte::ansi::{self, Color, Rgb},
+};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::Write;
 use std::path::Path;
 
-/// Fixed pty size; the shell wraps at this width.
-pub const PTY_ROWS: u16 = 50;
-pub const PTY_COLS: u16 = 200;
-/// Output buffer cap; the front is trimmed as output grows.
-pub const OUTPUT_CAP: usize = 256 * 1024;
+/// Fixed terminal size; a resizable pane is a follow-up.
+pub const TERM_COLS: usize = 80;
+pub const TERM_ROWS: usize = 30;
 
-/// State machine that strips ANSI/VT escape sequences from a byte stream.
-/// Handles sequences split across read boundaries (state persists between feeds).
-#[derive(Debug, Default)]
-pub struct AnsiFilter {
-    /// 0 = text, 1 = in CSI, 2 = in OSC, 3 = saw ESC inside OSC (ST pending)
-    state: u8,
-    last_was_nl: bool,
-    /// Incomplete UTF-8: pending[0..plen]
-    plen: u8,
-    pending: [u8; 4],
+/// Events the terminal exchanges with the UI.
+#[derive(Debug, Clone)]
+pub enum TermEvent {
+    /// Raw output bytes from the shell.
+    Output(Vec<u8>),
+    /// Bytes the emulator wants written to the shell (e.g. mouse reports).
+    PtyWrite(Vec<u8>),
+    /// The shell process exited.
+    Exited,
 }
 
-impl AnsiFilter {
-    pub fn feed(&mut self, chunk: &[u8], out: &mut String) {
-        for &b in chunk {
-            match (self.state, b) {
-                (0, 0x1b) => self.state = 1,
-                // `]` (0x5D) is inside the CSI final-byte range, so it must be
-                // matched first.
-                (1, b'[') => {}                     // stay in CSI (redundant intro)
-                (1, b']') => self.state = 2,        // OSC
-                (1, 0x1b) => {}                     // new escape; abandon the current one
-                (1, 0x20..=0x3f) => {}              // CSI params/intermediates
-                (1, 0x40..=0x7e) => self.state = 0, // CSI final byte
-                (1, _) => self.state = 0,           // 2-byte escape, done
-                (2, 0x07) => self.state = 0,        // OSC ended by BEL
-                (2, 0x1b) => self.state = 3,        // ST starts
-                (2, _) => {}                        // OSC content
-                (3, b'\\') => self.state = 0,       // ST complete
-                (3, _) => self.state = 0,           // malformed; treat as end
-                (0, 0x0d | 0x0a) => {
-                    // Map CR and LF to newline; collapse CRLF into one.
-                    if !self.last_was_nl {
-                        out.push('\n');
-                    }
-                    self.last_was_nl = true;
-                }
-                (0, b) => {
-                    self.last_was_nl = false;
-                    self.push_text(b, out);
-                }
-                _ => {}
-            }
-        }
-    }
+/// Forwards the emulator's `PtyWrite` requests to the UI over a channel.
+#[derive(Clone)]
+pub struct PtyProxy {
+    tx: futures::channel::mpsc::UnboundedSender<TermEvent>,
+}
 
-    /// Incremental UTF-8 decode (a multibyte char may be split across reads).
-    fn push_text(&mut self, b: u8, out: &mut String) {
-        if b < 0x80 {
-            self.flush_pending(out);
-            out.push(b as char);
-        } else if b & 0b1100_0000 == 0b1000_0000 {
-            if self.plen < 4 {
-                self.pending[self.plen as usize] = b;
-                self.plen += 1;
-            }
-            self.flush_pending(out);
-        } else {
-            self.plen = 1;
-            self.pending[0] = b;
-            self.flush_pending(out);
+impl EventListener for PtyProxy {
+    fn send_event(&self, event: Event) {
+        if let Event::PtyWrite(s) = event {
+            let _ = self.tx.unbounded_send(TermEvent::PtyWrite(s.into_bytes()));
         }
-    }
-
-    fn flush_pending(&mut self, out: &mut String) {
-        if self.plen == 0 {
-            return;
-        }
-        let need = match self.pending[0] {
-            0b1100_0000..=0b1100_0111 => 2,
-            0b1110_0000..=0b1110_1111 => 3,
-            0b1111_0000..=0b1111_0111 => 4,
-            _ => 1,
-        };
-        if self.plen as usize == need {
-            let c = std::str::from_utf8(&self.pending[..need])
-                .ok()
-                .and_then(|s| s.chars().next());
-            out.push(c.unwrap_or('\u{fffd}'));
-            self.plen = 0;
-        }
-    }
-
-    /// Discards any sequence/char left open (call when the shell exits).
-    pub fn reset(&mut self) {
-        self.state = 0;
-        self.plen = 0;
-        self.last_was_nl = false;
     }
 }
 
@@ -117,8 +59,8 @@ impl Session {
         let pts = native_pty_system();
         let pair = pts
             .openpty(PtySize {
-                rows: PTY_ROWS,
-                cols: PTY_COLS,
+                rows: TERM_ROWS as u16,
+                cols: TERM_COLS as u16,
                 pixel_width: 0,
                 pixel_height: 0,
             })
@@ -135,11 +77,7 @@ impl Session {
             .slave
             .spawn_command(cmd)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
-        Ok(Self {
-            master: pair.master,
-            writer,
-            child,
-        })
+        Ok(Self { master: pair.master, writer, child })
     }
 
     /// A readable handle for the reader thread.
@@ -165,17 +103,353 @@ impl Drop for Session {
     }
 }
 
-/// Appends a pty chunk to the output buffer: ANSI-stripped, front-capped.
-pub fn append_output(buf: &mut String, chunk: &[u8], filter: &mut AnsiFilter) {
-    let mut clean = String::new();
-    filter.feed(chunk, &mut clean);
-    buf.push_str(&clean);
-    if buf.len() > OUTPUT_CAP {
-        let mut cut = buf.len() - OUTPUT_CAP / 2;
-        while cut < buf.len() && !buf.is_char_boundary(cut) {
-            cut += 1;
+/// The terminal: emulator + shell + output plumbing.
+pub struct Terminal {
+    pub term: Term<PtyProxy>,
+    parser: ansi::Processor,
+    pub session: Option<Session>,
+    /// Cloned into the proxy and the reader thread.
+    pub tx: futures::channel::mpsc::UnboundedSender<TermEvent>,
+    /// The reader thread stays alive while the shell runs.
+    _reader: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Terminal {
+    /// Spawns the shell in `cwd` and a matching emulator grid.
+    pub fn spawn(
+        cwd: &Path,
+        tx: futures::channel::mpsc::UnboundedSender<TermEvent>,
+    ) -> std::io::Result<Self> {
+        let session = Session::spawn(cwd)?;
+        let config = alacritty_terminal::term::Config {
+            scrolling_history: 1000,
+            ..Default::default()
+        };
+        let term = Term::new(
+            config,
+            &TermSize::new(TERM_COLS, TERM_ROWS),
+            PtyProxy { tx: tx.clone() },
+        );
+        let mut terminal = Self {
+            term,
+            parser: ansi::Processor::new(),
+            session: Some(session),
+            tx,
+            _reader: None,
+        };
+        terminal.spawn_reader();
+        Ok(terminal)
+    }
+
+    fn spawn_reader(&mut self) {
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let Ok(mut reader) = session.reader() else {
+            return;
+        };
+        let tx = self.tx.clone();
+        self._reader = Some(std::thread::spawn(move || {
+            use std::io::Read;
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match reader.read(&mut buf) {
+                    Ok(0) => {
+                        let _ = tx.unbounded_send(TermEvent::Exited);
+                        break;
+                    }
+                    Ok(n) => {
+                        let _ = tx.unbounded_send(TermEvent::Output(buf[..n].to_vec()));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        // Unix ptys report EOF this way.
+                        let _ = tx.unbounded_send(TermEvent::Exited);
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }));
+    }
+
+    /// Feeds shell output through the VT state machine.
+    pub fn feed(&mut self, bytes: &[u8]) {
+        self.parser.advance(&mut self.term, bytes);
+    }
+
+    /// Sends input bytes to the shell.
+    pub fn write_bytes(&mut self, bytes: &[u8]) {
+        if let Some(session) = &mut self.session {
+            session.write(bytes).ok();
         }
-        buf.drain(..cut);
+    }
+
+    /// Whether the shell has bracketed paste mode on (vim et al.).
+    pub fn bracketed_paste(&self) -> bool {
+        self.term
+            .mode()
+            .contains(alacritty_terminal::term::TermMode::BRACKETED_PASTE)
+    }
+
+    /// Scrolls the display by whole lines.
+    pub fn scroll(&mut self, delta_lines: i32) {
+        if delta_lines != 0 {
+            self.term.scroll_display(Scroll::Delta(delta_lines));
+        }
+    }
+
+    /// Restarts the shell (new cwd); the emulator history is kept.
+    pub fn restart_shell(&mut self, cwd: &Path) {
+        match Session::spawn(cwd) {
+            Ok(session) => {
+                self.session = Some(session);
+                self.spawn_reader();
+            }
+            Err(e) => eprintln!("terminal: {e}"),
+        }
+    }
+}
+
+impl Drop for Terminal {
+    fn drop(&mut self) {
+        self.session.as_mut().map(|s| s.kill());
+    }
+}
+
+/// Maps a key event to the byte sequence a terminal expects, ported from
+/// alacritty/lapce's keyboard handling. `key` should be the *modified* key
+/// (shift applied), `modifiers` the full modifier state.
+pub fn key_bytes(
+    key: &iced_core::keyboard::Key,
+    modifiers: &iced_core::keyboard::Modifiers,
+) -> Option<Vec<u8>> {
+    use iced_core::keyboard::Key;
+
+    match key.as_ref() {
+        Key::Character(c) => {
+            if modifiers.control() && !modifiers.alt() {
+                // Ctrl+letter → C0 control character.
+                let c = c.chars().next()?;
+                let s = match c.to_ascii_lowercase() {
+                    'a' => "\x01",
+                    'b' => "\x02",
+                    'c' => "\x03",
+                    'd' => "\x04",
+                    'e' => "\x05",
+                    'f' => "\x06",
+                    'g' => "\x07",
+                    'h' => "\x08",
+                    'i' => "\x09",
+                    'j' => "\x0a",
+                    'k' => "\x0b",
+                    'l' => "\x0c",
+                    'm' => "\x0d",
+                    'n' => "\x0e",
+                    'o' => "\x0f",
+                    'p' => "\x10",
+                    'q' => "\x11",
+                    'r' => "\x12",
+                    's' => "\x13",
+                    't' => "\x14",
+                    'u' => "\x15",
+                    'v' => "\x16",
+                    'w' => "\x17",
+                    'x' => "\x18",
+                    'y' => "\x19",
+                    'z' => "\x1a",
+                    ' ' => "\x00",
+                    '[' => "\x1b",
+                    '\\' => "\x1c",
+                    ']' => "\x1d",
+                    '^' => "\x1e",
+                    '_' => "\x1f",
+                    _ => return None,
+                };
+                Some(s.as_bytes().to_vec())
+            } else if modifiers.alt() {                // Alt+letter → ESC prefix.
+                let mut v = vec![0x1b];
+                v.extend_from_slice(c.as_bytes());
+                Some(v)
+            } else {
+                let v = c.as_bytes().to_vec();
+                (!v.is_empty()).then_some(v)
+            }
+        }
+        Key::Named(named) => named_bytes(named, modifiers),
+        _ => None,
+    }
+}
+
+/// CSI modifier value: 1 + shift + 2·alt + 4·ctrl (xterm convention).
+fn modval(modifiers: &iced_core::keyboard::Modifiers) -> u8 {
+    1 + u8::from(modifiers.shift()) + 2 * u8::from(modifiers.alt()) + 4 * u8::from(modifiers.control())
+}
+
+/// Named (non-character) keys → escape sequences, with xterm modifier bits.
+fn named_bytes(
+    named: iced_core::keyboard::key::Named,
+    modifiers: &iced_core::keyboard::Modifiers,
+) -> Option<Vec<u8>> {
+    use iced_core::keyboard::key::Named as N;
+    let m = modval(modifiers);
+
+    let (base, fin): (&str, &str) = match named {
+        N::Backspace => ("\x7f", ""),
+        N::Enter => ("\r", ""),
+        N::Escape => ("\x1b", ""),
+        N::Tab => ("\x09", ""),
+        N::ArrowUp => ("\x1b[A", "A"),
+        N::ArrowDown => ("\x1b[B", "B"),
+        N::ArrowRight => ("\x1b[C", "C"),
+        N::ArrowLeft => ("\x1b[D", "D"),
+        N::Home => ("\x1b[H", "H"),
+        N::End => ("\x1b[F", "F"),
+        N::Delete => ("\x1b[3~", "~"),
+        N::Insert => ("\x1b[2~", "~"),
+        N::PageUp => ("\x1b[5~", "~"),
+        N::PageDown => ("\x1b[6~", "~"),
+        _ => return None,
+    };
+
+    if m == 1 {
+        Some(base.as_bytes().to_vec())
+    } else if base.len() == 3 && !fin.is_empty() {
+        // Arrows and Home/End: the 1;N form.
+        Some(format!("\x1b[1;{m}{fin}").into_bytes())
+    } else if fin == "~" {
+        // Tilde sequences: N~.
+        Some(format!("\x1b[{m}~").into_bytes())
+    } else if modifiers.alt() {
+        // Backspace/Enter/Esc/Tab: alt prefixes ESC.
+        let mut v = vec![0x1b];
+        v.extend_from_slice(base.as_bytes());
+        Some(v)
+    } else {
+        Some(base.as_bytes().to_vec())
+    }
+}
+
+/// One contiguous stretch of a line sharing one foreground color.
+#[derive(Debug, Clone)]
+pub struct Run {
+    pub col: usize,
+    pub text: String,
+    pub fg: Rgb,
+    pub bg: Rgb,
+}
+
+/// One visible row of the terminal grid.
+#[derive(Debug, Clone)]
+pub struct TermLine {
+    pub row: usize,
+    pub runs: Vec<Run>,
+}
+
+/// Fallback for the 16 named ANSI colors until the shell sets them (OSC 4).
+const ANSI_FALLBACK: [Rgb; 16] = [
+    Rgb { r: 0x36, g: 0x3a, b: 0x41 }, // black
+    Rgb { r: 0xf2, g: 0x6d, b: 0x50 }, // red
+    Rgb { r: 0xa1, g: 0xbd, b: 0x59 }, // green
+    Rgb { r: 0xfd, g: 0xd0, b: 0x5b }, // yellow
+    Rgb { r: 0x3f, g: 0x78, b: 0xb1 }, // blue
+    Rgb { r: 0xd3, g: 0x86, b: 0x9b }, // magenta
+    Rgb { r: 0x81, g: 0xa2, b: 0xbe }, // cyan
+    Rgb { r: 0x5c, g: 0x67, b: 0x73 }, // white
+    Rgb { r: 0x95, g: 0xa5, b: 0xa6 }, // bright black
+    Rgb { r: 0xf2, g: 0x6d, b: 0x50 },
+    Rgb { r: 0xa1, g: 0xbd, b: 0x59 },
+    Rgb { r: 0xfd, g: 0xd0, b: 0x5b },
+    Rgb { r: 0xb2, g: 0xc7, b: 0xe6 },
+    Rgb { r: 0xd3, g: 0x86, b: 0x9b },
+    Rgb { r: 0x81, g: 0xa2, b: 0xbe },
+    Rgb { r: 0x95, g: 0xa5, b: 0xa6 },
+];
+
+pub const DEFAULT_FG: Rgb = Rgb { r: 0xc7, g: 0xcc, b: 0xd1 };
+pub const DEFAULT_BG: Rgb = Rgb { r: 0x1e, g: 0x21, b: 0x26 };
+
+/// Resolves an SGR color against the terminal palette, with fallbacks.
+fn resolve(color: &Color) -> Rgb {
+    match color {
+        Color::Spec(rgb) => *rgb,
+        Color::Indexed(i) => {
+            // 0..16 named, 16..232 cube, 232..256 ramp.
+            if (*i as usize) < 16 {
+                ANSI_FALLBACK[*i as usize]
+            } else if (16..232).contains(&(*i as usize)) {
+                let i = *i as usize - 16;
+                let r5 = (i >> 5) & 7;
+                let g5 = (i >> 2) & 7;
+                let b5 = i & 7;
+                let f = |v: u32| if v == 0 { 0 } else { 55 + 40 * v };
+                Rgb { r: f(r5 as u32) as u8, g: f(g5 as u32) as u8, b: f(b5 as u32) as u8 }
+            } else if (232..256).contains(&(*i as usize)) {
+                let v = (8 + 10 * (*i as usize - 232)) as u8;
+                Rgb { r: v, g: v, b: v }
+            } else {
+                DEFAULT_FG
+            }
+        }
+        Color::Named(n) => {
+            let i = *n as usize;
+            if i < 16 {
+                ANSI_FALLBACK[i]
+            } else {
+                DEFAULT_FG
+            }
+        }
+    }
+}
+impl Terminal {
+    /// The visible viewport as colored runs, ready for the canvas.
+    pub fn lines(&self) -> Vec<TermLine> {
+        let grid = self.term.grid();
+        let top = grid.topmost_line().0;
+        let bottom = grid.bottommost_line().0;
+        let mut out = Vec::new();
+        for (i, line_no) in (top..=bottom).enumerate() {
+            let row = &grid[Line(line_no)];
+            let len = row.len().min(TERM_COLS);
+            let mut runs = Vec::new();
+            let mut cur: Option<Run> = None;
+            for col in 0..len {
+                let cell = &row[Column(col)];
+                let fg = resolve(&cell.fg);
+                let bg = resolve(&cell.bg);
+                match cur.as_mut() {
+                    Some(r) if r.fg == fg && r.bg == bg => {
+                        r.text.push(cell.c);
+                    }
+                    _ => {
+                        if let Some(r) = cur.take() {
+                            runs.push(r);
+                        }
+                        let text = cell.c.to_string();
+                        let mut r = Run { col, fg, bg, text: String::new() };
+                        r.text = text;
+                        cur = Some(r);
+                    }
+                }
+            }
+            if let Some(r) = cur.take() {
+                runs.push(r);
+            }
+            out.push(TermLine { row: i, runs });
+        }
+        out
+    }
+
+    /// The cursor position in viewport coordinates (row, col), if visible.
+    pub fn cursor(&self) -> Option<(usize, usize)> {
+        let rc = self.term.renderable_content();
+        let p: Point = rc.cursor.point;
+        let top = self.term.grid().topmost_line().0;
+        let row = p.line.0 - top;
+        if (0..TERM_ROWS as i32).contains(&row) {
+            Some((row as usize, p.column.0 as usize))
+        } else {
+            None
+        }
     }
 }
 
@@ -183,59 +457,105 @@ pub fn append_output(buf: &mut String, chunk: &[u8], filter: &mut AnsiFilter) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn strips_csi_and_osc() {
-        let mut f = AnsiFilter::default();
-        let mut out = String::new();
-        f.feed(b"\x1b[31mred\x1b[0m and \x1b]0;title\x07ok", &mut out);
-        assert_eq!(out, "red and ok");
+    fn term_with(bytes: &[u8]) -> Terminal {
+        use std::io::Write;
+        let (tx, _rx) = futures::channel::mpsc::unbounded::<TermEvent>();
+        let session = Session::spawn(std::path::Path::new("/")).ok();
+        let config = alacritty_terminal::term::Config {
+            scrolling_history: 100,
+            ..Default::default()
+        };
+        let term = Term::new(
+            config,
+            &TermSize::new(TERM_COLS, TERM_ROWS),
+            PtyProxy { tx },
+        );
+        let mut t = Terminal {
+            term,
+            parser: ansi::Processor::new(),
+            session,
+            tx: {
+                let (tx, _rx) = futures::channel::mpsc::unbounded();
+                tx
+            },
+            _reader: None,
+        };
+        t.feed(bytes);
+        t
     }
 
     #[test]
-    fn handles_split_csi() {
-        let mut f = AnsiFilter::default();
-        let mut out = String::new();
-        f.feed(b"\x1b[3", &mut out); // sequence split across reads
-        f.feed(b"1mx\x1b[0m", &mut out);
-        assert_eq!(out, "x");
+    fn feed_renders_text() {
+        let t = term_with(b"hello");
+        let lines = t.lines();
+        let first: String = lines[0].runs.iter().flat_map(|r| r.text.chars()).collect();
+        assert!(first.starts_with("hello"));
     }
 
     #[test]
-    fn strips_osc_split_at_st() {
-        let mut f = AnsiFilter::default();
-        let mut out = String::new();
-        f.feed(b"\x1b]0;my", &mut out);
-        f.feed(b"title\x1b\\after", &mut out);
-        assert_eq!(out, "after");
+    fn feed_moves_cursor_and_overwrites() {
+        // "abc", cursor left two, write " X" → "a X" (overwrite in place).
+        let t = term_with(b"abc\x1b[D\x1b[D X");
+        let lines = t.lines();
+        let first: String = lines[0].runs.iter().flat_map(|r| r.text.chars()).collect();
+        assert!(first.starts_with("a X"), "got {first:?}");
     }
 
     #[test]
-    fn collapses_crlf_and_maps_cr() {
-        let mut f = AnsiFilter::default();
-        let mut out = String::new();
-        f.feed(b"line1\r\nline2\rdone", &mut out);
-        assert_eq!(out, "line1\nline2\ndone");
+    fn clear_screen_works() {
+        // On the alt screen, CSI 2J clears in place (main screen would scroll
+        // the content into scrollback, which this fixed-size test grid lacks).
+        let t = term_with(b"\x1b[?1049hjunk\r\ntext\x1b[2J");
+        let lines = t.lines();
+        let all: String = lines.iter().flat_map(|l| l.runs.iter().flat_map(|r| r.text.chars())).collect();
+        assert!(!all.contains("junk") && !all.contains("text"), "got {all:?}");
     }
 
     #[test]
-    fn utf8_split_across_chunks() {
-        let mut f = AnsiFilter::default();
-        let mut out = String::new();
-        let bytes = "héllo 你好".as_bytes();
-        for (i, _) in bytes.iter().enumerate() {
-            f.feed(&bytes[i..=i], &mut out); // one byte per read: worst-case splits
-        }
-        assert_eq!(out, "héllo 你好");
+    fn colors_produce_distinct_runs() {
+        let t = term_with(b"\x1b[31mred\x1b[0mplain");
+        let lines = t.lines();
+        assert!(lines[0].runs.len() >= 2);
     }
 
     #[test]
-    fn output_cap_trims_front() {
-        let mut f = AnsiFilter::default();
-        let mut buf = String::new();
-        for _ in 0..OUTPUT_CAP {
-            append_output(&mut buf, b"ab", &mut f);
-        }
-        assert!(buf.len() <= OUTPUT_CAP);
-        assert!(buf.len() >= OUTPUT_CAP / 2);
+    fn key_mapping_ctrl_c() {
+        use iced_core::keyboard::{key, Key, Modifiers};
+        let m = Modifiers::CTRL;
+        assert_eq!(key_bytes(&Key::Named(key::Named::Control), &m), None);
+    }
+
+    #[test]
+    fn key_mapping_basics() {
+        use iced_core::keyboard::{key, Key, Modifiers};
+        let none = Modifiers::empty();
+        assert_eq!(key_bytes(&Key::Character("l".into()), &none), Some(b"l".to_vec()));
+        assert_eq!(key_bytes(&Key::Named(key::Named::Enter), &none), Some(b"\r".to_vec()));
+        assert_eq!(
+            key_bytes(&Key::Named(key::Named::ArrowUp), &none),
+            Some(b"\x1b[A".to_vec())
+        );
+        let ctrl = Modifiers::CTRL;
+        assert_eq!(key_bytes(&Key::Character("c".into()), &ctrl), Some(vec![0x03]));
+        let shift = Modifiers::SHIFT;
+        assert_eq!(
+            key_bytes(&Key::Named(key::Named::ArrowUp), &shift),
+            Some(b"\x1b[1;2A".to_vec())
+        );
+        let alt = Modifiers::ALT;
+        assert_eq!(key_bytes(&Key::Character("a".into()), &alt), Some(vec![0x1b, b'a']));
+    }
+
+    fn test_key(c: char) -> iced_core::keyboard::Key {
+        iced_core::keyboard::Key::Character(c.to_string().into())
+    }
+
+    #[test]
+    fn key_mapping_ctrl_letters() {
+        use iced_core::keyboard::Modifiers;
+        let ctrl = Modifiers::CTRL;
+        assert_eq!(key_bytes(&test_key('c'), &ctrl), Some(vec![0x03]));
+        assert_eq!(key_bytes(&test_key('z'), &ctrl), Some(vec![0x1a]));
+        assert_eq!(key_bytes(&test_key('h'), &ctrl), Some(vec![0x08]));
     }
 }
